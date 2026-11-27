@@ -1,0 +1,113 @@
+name: Build Watch-enabled SideStore IPA
+
+on:
+  push:
+    branches: [main, watch-develop]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: watch-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/native-target
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+      FAIRWAY_TEST_IPA: ${{ github.workspace }}/WatchBuild/fixtures/Fairway-0.3.0-unsigned.ipa
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          repository: SideStore/SideStore
+          ref: 4f3d18d98c5fbee72c80f787ceb2e8e09ded60a6
+          submodules: recursive
+          path: build/SideStore
+      - uses: actions/checkout@v4
+        with:
+          repository: SideStore/idevice
+          ref: 3e55c8486b2057e40c1f74aaaa1155c82341cf76
+          path: build/SideStore/NativeIDeviceSource
+      - uses: actions/checkout@v4
+        with:
+          repository: mahee96/CodeSignKit
+          ref: d0c67710fda9a2646b9e829cb2cf443892728371
+          path: build/SideStore/Dependencies/CodeSignKit
+      - uses: actions/checkout@v4
+        with:
+          repository: 9andmoai/Fairway
+          ref: 5fbb18175e69255c117b16ed0bca7bc59e209d89
+          path: build/Fairway
+      - name: Apply pinned overlays and publish adapted source
+        run: |
+          python3 build/Fairway/tools/watch-support/apply.py build/SideStore build/SideStore/Dependencies/SideSign
+          python3 build/Fairway/tools/watch-support/apply_connection_probe.py build/SideStore build/SideStore/NativeIDeviceSource
+          python3 build/Fairway/tools/watch-support/apply_watch_install.py build/SideStore build/SideStore/NativeIDeviceSource
+          python3 build/Fairway/tools/watch-support/apply_refresh_diagnostic.py build/SideStore
+          python3 build/Fairway/tools/watch-support/apply_group_refresh_fix.py build/SideStore
+          python3 build/Fairway/tools/watch-support/apply_os_recovery.py build/SideStore
+          python3 WatchBuild/assemble_sources.py
+      - name: Toolchain information
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+          mkdir -p build/logs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Recovery policy tests
+        run: |
+          set -o pipefail
+          swift test --package-path WatchBuild/Recovery 2>&1 | tee build/logs/recovery-tests.log
+      - name: Native Watch tests
+        working-directory: NativeIDeviceSource
+        run: |
+          set -o pipefail
+          cargo test --locked -p idevice-ffi --features companion_proxy,pair --lib watch_ 2>&1 | tee ../build/logs/native-tests.log
+      - name: Build patched native iPhone library
+        working-directory: NativeIDeviceSource
+        run: |
+          set -o pipefail
+          export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$(xcrun --sdk iphoneos --show-sdk-path)"
+          cargo build --locked -p idevice-ffi --release --target aarch64-apple-ios --features companion_proxy,pair,obfuscate 2>&1 | tee ../build/logs/native-build.log
+          cp ffi/idevice.h swift/include/idevice.h
+          xcodebuild -create-xcframework -library "$CARGO_TARGET_DIR/aarch64-apple-ios/release/libidevice_ffi.a" -headers swift/include -output ../NativeIDevice.xcframework
+      - name: Watch signing and certificate parsing tests
+        working-directory: Dependencies/SideSign
+        run: |
+          set -o pipefail
+          swift test --filter 'WatchSupportTests|OSRecoveryTests' 2>&1 | tee ../../build/logs/signing-tests.log
+      - name: Build and package IPA
+        run: |
+          set -o pipefail
+          brew install ldid
+          make build 2>&1 | tee build/logs/xcode-build.log
+          make fakesign ipa 2>&1 | tee build/logs/package.log
+          python3 WatchBuild/package_build.py
+      - name: Upload IPA and corresponding source
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-Watch-OS-Recovery-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload test and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-Watch-build-logs-${{ github.run_number }}
+          path: build/logs/*
+          if-no-files-found: warn
+          retention-days: 14
+
