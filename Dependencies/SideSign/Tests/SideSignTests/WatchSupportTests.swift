@@ -1,0 +1,231 @@
+import XCTest
+import CodeSignKit
+@testable import SideSign
+
+final class WatchSupportTests: XCTestCase {
+    func testRepeatedRefreshGroupIsStableAndRepairsFairway() {
+        let team = "TESTTEAM00"
+        let original = "group.local.fairway.score"
+        let once = original + "." + team
+        let repeated = original + String(repeating: "." + team, count: 14)
+        XCTAssertEqual(WatchBundleSupport.stableRefreshGroup(original, team: team), once)
+        XCTAssertEqual(WatchBundleSupport.stableRefreshGroup(repeated, team: team), once)
+        var current = once
+        for _ in 0..<30 { current = WatchBundleSupport.stableRefreshGroup(current, team: team) }
+        XCTAssertEqual(current, once)
+        let other = "group.other." + team + "." + team
+        XCTAssertEqual(WatchBundleSupport.stableRefreshGroup(other, team: team), other)
+    }
+
+    private let team = "TESTTEAM00"
+    private let udid = "00000000-0000000000000001"
+    private func profile(platform: String = "watchOS", bundle: String = "local.test.watch", target: String? = nil, expires: Date = Date().addingTimeInterval(3600), platforms: [String]? = nil) throws -> ProvisioningProfile {
+        let data: [String: Any] = ["Name": "Synthetic test", "UUID": UUID().uuidString,
+            "TeamIdentifier": [team], "TeamName": "Synthetic", "CreationDate": Date(), "ExpirationDate": expires,
+            "Entitlements": ["application-identifier": team + "." + bundle],
+            "ProvisionedDevices": [target ?? udid], "Platform": platforms ?? [platform], "LocalProvision": true]
+        let xml = try PropertyListSerialization.data(fromPropertyList: data, format: .xml, options: 0)
+        // Parsing fixture only. This is deliberately not a cryptographically valid profile.
+        return try ProvisioningProfile(data: Data("fixture-prefix".utf8) + xml)
+    }
+    private func host(at root: URL, companion: String = "local.test", child: String = "local.test.watch") throws -> AppBundle {
+        let host = root.appendingPathComponent("Host.app")
+        let watch = host.appendingPathComponent("Watch/Watch.app")
+        try FileManager.default.createDirectory(at: watch, withIntermediateDirectories: true)
+        for (url, id, extra) in [(host, "local.test", [:] as [String: Any]),
+                                 (watch, child, ["WKApplication": true, "WKCompanionAppBundleIdentifier": companion])] {
+            var dict: [String: Any] = ["CFBundleIdentifier": id, "CFBundleName": "Fixture", "CFBundlePackageType": "APPL", "CFBundleExecutable": "Fixture"]
+            dict.merge(extra) { _, new in new }
+            try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0).write(to: url.appendingPathComponent("Info.plist"))
+        }
+        return try XCTUnwrap(AppBundle(fileURL: host))
+    }
+    func testModernUDID() throws { XCTAssertEqual(try WatchBundleSupport.validateUDID(" " + udid + "\n"), udid) }
+    func testLegacyUDID() throws { XCTAssertEqual(try WatchBundleSupport.validateUDID(String(repeating: "a", count: 40)).count, 40) }
+    func testSerialNumberRejected() { XCTAssertThrowsError(try WatchBundleSupport.validateUDID("WATCHSERIAL123")) }
+    func testEmptyUDIDRejected() { XCTAssertThrowsError(try WatchBundleSupport.validateUDID("")) }
+    func testParentRewriteOnce() throws {
+        XCTAssertEqual(try WatchBundleSupport.identifier("local.test.watch", from: "local.test", to: "local.test.TEAM"), "local.test.TEAM.watch")
+    }
+    func testPrefixCollisionRejected() { XCTAssertThrowsError(try WatchBundleSupport.identifier("local.testing.watch", from: "local.test", to: "new.id")) }
+    func testUnrelatedBundleRejected() { XCTAssertThrowsError(try WatchBundleSupport.identifier("other.watch", from: "local.test", to: "new.id")) }
+    func testValidWatchProfile() throws { try WatchBundleSupport.validate(profile(), bundleID: "local.test.watch", teamID: team, udid: udid) }
+    func testPhoneProfileCannotSignWatch() throws { XCTAssertThrowsError(try WatchBundleSupport.validate(profile(platform: "iOS"), bundleID: "local.test.watch", teamID: team, udid: udid)) { XCTAssertTrue($0.localizedDescription.contains("WPF_PLATFORM")) } }
+    func testWrongWatchRejected() throws { XCTAssertThrowsError(try WatchBundleSupport.validate(profile(target: "00000000-0000000000000002"), bundleID: "local.test.watch", teamID: team, udid: udid)) { XCTAssertTrue($0.localizedDescription.contains("WPF_DEVICE")) } }
+    func testExpiredProfileRejected() throws { XCTAssertThrowsError(try WatchBundleSupport.validate(profile(expires: Date().addingTimeInterval(-1)), bundleID: "local.test.watch", teamID: team, udid: udid)) { XCTAssertTrue($0.localizedDescription.contains("WPF_EXPIRED")) } }
+    func testWrongTeamRejected() throws { XCTAssertThrowsError(try WatchBundleSupport.validate(profile(), bundleID: "local.test.watch", teamID: "OTHER", udid: udid)) { XCTAssertTrue($0.localizedDescription.contains("WPF_TEAM")) } }
+    func testWrongIDRejected() throws { XCTAssertThrowsError(try WatchBundleSupport.validate(profile(), bundleID: "local.test.wrong", teamID: team, udid: udid)) { XCTAssertTrue($0.localizedDescription.contains("WPF_APP_ID")) } }
+    func testDiagnosticsReportAllFailuresWithoutIdentifiers() throws {
+        let value = try profile(platform: "iOS", target: "00000000-0000000000000002", expires: Date().addingTimeInterval(-60))
+        XCTAssertThrowsError(try WatchBundleSupport.validate(value, bundleID: "private.expected.id", teamID: "OTHER", udid: udid)) { error in
+            let message = error.localizedDescription
+            for code in ["WPF_PLATFORM", "WPF_APP_ID", "WPF_TEAM", "WPF_DEVICE", "WPF_EXPIRED"] { XCTAssertTrue(message.contains(code), code) }
+            for identifier in [self.udid, self.team, "OTHER", "private.expected.id", "local.test.watch", "00000000-0000000000000002"] { XCTAssertFalse(message.contains(identifier), identifier) }
+        }
+    }
+    func testWatchOSPlatformCaseIsIgnored() throws { try WatchBundleSupport.validate(profile(platform: "WATCHOS"), bundleID: "local.test.watch", teamID: team, udid: udid) }
+    func testWatchScopedIOSFamilyProfileAccepted() throws {
+        for platforms in [["iOS"], ["iOS", "visionOS"], ["iOS", "xrOS", "visionOS"]] {
+            try WatchBundleSupport.validate(profile(platforms: platforms), bundleID: "local.test.watch", teamID: team, udid: udid, allowIOSFamily: true)
+        }
+    }
+    func testIOSFamilyProfileRequiresWatchScope() throws {
+        XCTAssertThrowsError(try WatchBundleSupport.validate(profile(platforms: ["iOS", "visionOS"]), bundleID: "local.test.watch", teamID: team, udid: udid)) {
+            XCTAssertTrue($0.localizedDescription.contains("WPF_PLATFORM"))
+        }
+    }
+    func testIOSFamilyWrongWatchRejected() throws {
+        XCTAssertThrowsError(try WatchBundleSupport.validate(profile(target: "00000000-0000000000000002", platforms: ["iOS", "visionOS"]), bundleID: "local.test.watch", teamID: team, udid: udid, allowIOSFamily: true)) {
+            XCTAssertTrue($0.localizedDescription.contains("WPF_DEVICE"))
+        }
+    }
+    func testIOSFamilyCannotBypassIdentityTeamOrExpiry() throws {
+        let value = try profile(expires: Date().addingTimeInterval(-60), platforms: ["iOS", "visionOS"])
+        XCTAssertThrowsError(try WatchBundleSupport.validate(value, bundleID: "wrong.id", teamID: "WRONGTEAM", udid: udid, allowIOSFamily: true)) {
+            for code in ["WPF_APP_ID", "WPF_TEAM", "WPF_EXPIRED"] { XCTAssertTrue($0.localizedDescription.contains(code)) }
+            XCTAssertFalse($0.localizedDescription.contains("WPF_PLATFORM"))
+        }
+    }
+    func testUnsupportedPlatformsStillRejectedInWatchScope() throws {
+        for platforms in [[], ["tvOS"], ["visionOS"], ["macOS"], ["iOS", "tvOS"]] as [[String]] {
+            XCTAssertThrowsError(try WatchBundleSupport.validate(profile(platforms: platforms), bundleID: "local.test.watch", teamID: team, udid: udid, allowIOSFamily: true)) {
+                XCTAssertTrue($0.localizedDescription.contains("WPF_PLATFORM"))
+            }
+        }
+    }
+    func testWatchGraph() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = try host(at: root)
+        XCTAssertEqual(try WatchBundleSupport.applications(in: app).count, 1)
+        XCTAssertEqual(app.watchSigningBundles.count, 1)
+        // Keep the existing phone customization pipeline's bundle set unchanged.
+        XCTAssertEqual(app.allAppBundles.count, 1)
+    }
+    func testWrongCompanionRejected() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        XCTAssertThrowsError(try WatchBundleSupport.applications(in: host(at: root, companion: "wrong.host")))
+    }
+    func testWrongChildIDRejected() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        XCTAssertThrowsError(try WatchBundleSupport.applications(in: host(at: root, child: "other.watch")))
+    }
+    func testWatchSymlinkOutsideHostRejected() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = try host(at: root)
+        let watch = app.fileURL.appendingPathComponent("Watch/Watch.app")
+        let external = root.appendingPathComponent("Outside.app")
+        try FileManager.default.moveItem(at: watch, to: external)
+        try FileManager.default.createSymbolicLink(at: watch, withDestinationURL: external)
+        XCTAssertThrowsError(try WatchBundleSupport.applications(in: app))
+    }
+
+    #if os(macOS)
+    func testNestedWatchReceivesItsOwnSignedEntitlements() async throws {
+        try await verifySignedPayload(realIPA: false)
+    }
+    func testActualFairwayIPAWithRewrittenCompanionAndAllArchitectures() async throws {
+        try await verifySignedPayload(realIPA: true)
+    }
+    private func verifySignedPayload(realIPA: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func command(_ executable: String, _ arguments: [String]) throws -> Data {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            let output = Pipe(); let errors = Pipe()
+            process.standardOutput = output; process.standardError = errors
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let error = errors.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw WatchSupportError.invalid("Offline fixture command failed: " + String(decoding: error, as: UTF8.self))
+            }
+            if arguments.contains("--entitlements") {
+                let combined = String(decoding: data + error, as: UTF8.self)
+                guard let begin = combined.range(of: "<?xml"), let end = combined.range(of: "</plist>") else {
+                    throw WatchSupportError.invalid("Apple codesign did not return XML entitlements: " + String(combined.prefix(2000)))
+                }
+                return Data(combined[begin.lowerBound..<end.upperBound].utf8)
+            }
+            return data
+        }
+        let app: AppBundle
+        if realIPA {
+            guard let path = ProcessInfo.processInfo.environment["FAIRWAY_TEST_IPA"] else {
+                throw XCTSkip("Real IPA must be supplied explicitly; CI requires this test input")
+            }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            _ = try command("/usr/bin/ditto", ["-x", "-k", path, root.path])
+            app = try XCTUnwrap(AppBundle(fileURL: root.appendingPathComponent("Payload/Fairway.app")))
+            let oldID = app.bundleIdentifier
+            let newID = oldID + "." + team
+            // Use the production relationship helper, then reload AppBundle to avoid cached plist values.
+            for child in app.watchSigningBundles {
+                var info: [String: Any] = child.infoPlist
+                info["CFBundleIdentifier"] = try WatchBundleSupport.identifier(child.bundleIdentifier, from: oldID, to: newID)
+                let relationships = try WatchBundleSupport.relationships(in: info, from: oldID, to: newID)
+                for (key, value) in relationships { info[key] = value }
+                try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: child.fileURL.appendingPathComponent("Info.plist"))
+            }
+            var info = app.infoPlist
+            info["CFBundleIdentifier"] = newID
+            try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: app.fileURL.appendingPathComponent("Info.plist"))
+        } else {
+            app = try host(at: root)
+            let source = root.appendingPathComponent("fixture.c")
+            try Data("int main(void) { return 0; }".utf8).write(to: source)
+            let phoneSDK = String(decoding: try command("/usr/bin/xcrun", ["--sdk", "iphoneos", "--show-sdk-path"]), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            let watchSDK = String(decoding: try command("/usr/bin/xcrun", ["--sdk", "watchos", "--show-sdk-path"]), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            _ = try command("/usr/bin/xcrun", ["clang", "-target", "arm64-apple-ios17.0", "-isysroot", phoneSDK, source.path, "-o", app.fileURL.appendingPathComponent("Fixture").path])
+            _ = try command("/usr/bin/xcrun", ["clang", "-target", "arm64_32-apple-watchos10.0", "-isysroot", watchSDK, source.path, "-o", app.fileURL.appendingPathComponent("Watch/Watch.app/Fixture").path])
+        }
+        let payload = try XCTUnwrap(AppBundle(fileURL: app.fileURL))
+        let watches = try WatchBundleSupport.applications(in: payload)
+        XCTAssertEqual(watches.count, 1)
+        let watch = try XCTUnwrap(watches.first)
+        let watchURL = watch.fileURL
+        let key = root.appendingPathComponent("fixture-key.pem")
+        let cert = root.appendingPathComponent("fixture-cert.pem")
+        let p12 = root.appendingPathComponent("fixture.p12")
+        let config = root.appendingPathComponent("fixture.cnf")
+        try """
+        [req]
+        distinguished_name = dn
+        x509_extensions = code_signing
+        prompt = no
+        [dn]
+        CN = Offline Watch Test
+        OU = \(team)
+        [code_signing]
+        basicConstraints = critical,CA:FALSE
+        keyUsage = critical,digitalSignature
+        extendedKeyUsage = critical,codeSigning
+        """.write(to: config, atomically: true, encoding: .utf8)
+        _ = try command("/usr/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "1", "-config", config.path, "-keyout", key.path, "-out", cert.path])
+        _ = try command("/usr/bin/openssl", ["pkcs12", "-export", "-inkey", key.path, "-in", cert.path, "-out", p12.path, "-passout", "pass:fixture"])
+        let identity = try KeyStore(p12Data: Data(contentsOf: p12), password: "fixture")
+        let signer = AppBundleSigner(team: Team(identifier: team, name: "Offline", type: .free), keyStore: identity)
+        try await signer.signApp(at: payload.fileURL, provisioningProfiles: [profile(platform: "iOS", bundle: payload.bundleIdentifier), profile(bundle: watch.bundleIdentifier)])
+        let rawEntitlements = try MachOParser.entitlements(at: watchURL)
+        XCTAssertFalse(rawEntitlements.isEmpty, "Watch executable has no entitlements after signing")
+        let embedded = try XCTUnwrap(PropertyListSerialization.propertyList(from: Data(rawEntitlements.utf8), options: [], format: nil) as? [String: Any])
+        XCTAssertEqual(embedded["application-identifier"] as? String, team + "." + watch.bundleIdentifier)
+        // Verifies nested Mach-O signatures and resource seals; this is not Apple provisioning approval.
+        _ = try command("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--all-architectures", payload.fileURL.path])
+        if realIPA {
+            let archs = String(decoding: try command("/usr/bin/lipo", ["-archs", watchURL.appendingPathComponent(watch.infoPlist["CFBundleExecutable"] as! String).path]), as: UTF8.self)
+            XCTAssertTrue(archs.contains("arm64_32"), "Series 7 slice must remain present")
+            XCTAssertTrue(archs.split(separator: " ").contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "arm64" })
+        }
+        let watchEntitlements = try command("/usr/bin/codesign", ["--display", "--entitlements", "-", "--xml", watchURL.path])
+        let values = try XCTUnwrap(PropertyListSerialization.propertyList(from: watchEntitlements, options: [], format: nil) as? [String: Any])
+        XCTAssertEqual(values["application-identifier"] as? String, team + "." + watch.bundleIdentifier)
+    }
+    #endif
+}

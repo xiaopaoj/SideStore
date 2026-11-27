@@ -1,0 +1,13 @@
+build/
+artifacts/
+NativeIDevice.xcframework/
+SideStore.xcarchive/
+Payload/
+SideStore.ipa
+**/.build/
+**/.swiftpm/
+**/__pycache__/
+**/target/
+CodeSigning.xcconfig
+*.p12
+*.mobileprovision
