@@ -28,27 +28,32 @@ jobs:
         with:
           ref: main
       - uses: actions/checkout@v4
+        if: hashFiles('WatchBuild/source-pins.json') == ''
         with:
           repository: SideStore/SideStore
           ref: 4f3d18d98c5fbee72c80f787ceb2e8e09ded60a6
           submodules: recursive
           path: build/SideStore
       - uses: actions/checkout@v4
+        if: hashFiles('WatchBuild/source-pins.json') == ''
         with:
           repository: SideStore/idevice
           ref: 3e55c8486b2057e40c1f74aaaa1155c82341cf76
           path: build/SideStore/NativeIDeviceSource
       - uses: actions/checkout@v4
+        if: hashFiles('WatchBuild/source-pins.json') == ''
         with:
           repository: mahee96/CodeSignKit
           ref: d0c67710fda9a2646b9e829cb2cf443892728371
           path: build/SideStore/Dependencies/CodeSignKit
       - uses: actions/checkout@v4
+        if: hashFiles('WatchBuild/source-pins.json') == ''
         with:
           repository: 9andmoai/Fairway
           ref: 5fbb18175e69255c117b16ed0bca7bc59e209d89
           path: build/Fairway
       - name: Apply pinned overlays and publish adapted source
+        if: hashFiles('WatchBuild/source-pins.json') == ''
         run: |
           python3 build/Fairway/tools/watch-support/apply.py build/SideStore build/SideStore/Dependencies/SideSign
           python3 build/Fairway/tools/watch-support/apply_connection_probe.py build/SideStore build/SideStore/NativeIDeviceSource

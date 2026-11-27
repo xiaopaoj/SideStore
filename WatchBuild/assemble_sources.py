@@ -11,8 +11,9 @@ overlays = root/'build/Fairway'
 skip = {'.git', '__pycache__', '.build', '.swiftpm', 'target'}
 paths = []
 for directory, dirs, files in os.walk(source):
+    links = [name for name in dirs if (Path(directory)/name).is_symlink()]
     dirs[:] = [name for name in dirs if name not in skip]
-    for name in files:
+    for name in files + links:
         path = Path(directory)/name
         relative = path.relative_to(source)
         if name in {'.git', '.gitmodules', 'CodeSigning.xcconfig'}:
@@ -23,7 +24,11 @@ for directory, dirs, files in os.walk(source):
             relative = Path('.github/upstream-workflows').joinpath(*relative.parts[2:])
         destination = root/relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination, follow_symlinks=False)
+        if path.is_symlink() and destination.is_symlink():
+            if os.readlink(path) != os.readlink(destination):
+                raise RuntimeError(f'Existing symbolic link differs: {relative}')
+        else:
+            shutil.copy2(path, destination, follow_symlinks=False)
         paths.append(relative.as_posix())
 
 for origin, destination in [
