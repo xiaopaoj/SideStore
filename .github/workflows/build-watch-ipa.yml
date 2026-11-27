@@ -66,6 +66,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - name: Restore native and signing build cache
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/native-target
+            ~/.cargo/registry
+            ~/.cargo/git
+            Dependencies/SideSign/.build
+            WatchBuild/Recovery/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: macos-watch-v1-${{ hashFiles('NativeIDeviceSource/Cargo.lock', 'Dependencies/SideSign/Package.swift', 'WatchBuild/source-pins.json') }}
       - name: Recovery policy tests
         run: |
           set -o pipefail
@@ -92,7 +104,7 @@ jobs:
         run: |
           set -o pipefail
           brew install ldid
-          make build 2>&1 | tee build/logs/xcode-build.log
+          make -B build 2>&1 | tee build/logs/xcode-build.log
           make fakesign ipa 2>&1 | tee build/logs/package.log
           python3 WatchBuild/package_build.py
       - name: Upload IPA and corresponding source
@@ -110,4 +122,16 @@ jobs:
           path: build/logs/*
           if-no-files-found: warn
           retention-days: 14
+      - name: Save native and signing build cache
+        if: always() && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/native-target
+            ~/.cargo/registry
+            ~/.cargo/git
+            Dependencies/SideSign/.build
+            WatchBuild/Recovery/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: macos-watch-v1-${{ hashFiles('NativeIDeviceSource/Cargo.lock', 'Dependencies/SideSign/Package.swift', 'WatchBuild/source-pins.json') }}
 
