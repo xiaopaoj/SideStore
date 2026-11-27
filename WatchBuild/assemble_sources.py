@@ -23,7 +23,7 @@ for directory, dirs, files in os.walk(source):
             relative = Path('.github/upstream-workflows').joinpath(*relative.parts[2:])
         destination = root/relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
+        shutil.copy2(path, destination, follow_symlinks=False)
         paths.append(relative.as_posix())
 
 for origin, destination in [
